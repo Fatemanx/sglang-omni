@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import io
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -77,9 +78,44 @@ def load_audio(source: Any) -> np.ndarray:
     if isinstance(source, bytearray):
         source = bytes(source)
 
+    soundfile_source: Any
+    if isinstance(source, bytes):
+        soundfile_source = io.BytesIO(source)
+    elif isinstance(source, (str, os.PathLike)):
+        soundfile_source = source
+    else:
+        raise ValueError(f"Unsupported Qwen3-ASR audio input: {type(source).__name__}")
+
+    try:
+        audio_np, sample_rate = _read_audio_with_soundfile(soundfile_source)
+    except Exception:
+        audio, sample_rate = _load_audio_with_torchaudio(source)
+    else:
+        if audio_np.ndim == 2:
+            audio_np = audio_np.mean(axis=1)
+        audio = torch.from_numpy(np.ascontiguousarray(audio_np, dtype=np.float32))
+
+    if sample_rate != _SAMPLE_RATE:
+        audio = torchaudio.functional.resample(audio, sample_rate, _SAMPLE_RATE)
+    return np.ascontiguousarray(audio.cpu().numpy(), dtype=np.float32)
+
+
+def _read_audio_with_soundfile(source: Any) -> tuple[np.ndarray, int]:
+    import soundfile as sf
+
+    return sf.read(
+        source,
+        dtype="float32",
+        always_2d=False,
+    )
+
+
+def _load_audio_with_torchaudio(source: Any) -> tuple[torch.Tensor, int]:
+    import torchaudio
+
     if isinstance(source, bytes):
         audio, sample_rate = torchaudio.load(io.BytesIO(source))
-    elif isinstance(source, str):
+    elif isinstance(source, (str, os.PathLike)):
         audio, sample_rate = torchaudio.load(source)
     else:
         raise ValueError(f"Unsupported Qwen3-ASR audio input: {type(source).__name__}")
@@ -87,9 +123,7 @@ def load_audio(source: Any) -> np.ndarray:
     if audio.ndim == 2 and audio.shape[0] > 1:
         audio = audio.mean(dim=0, keepdim=True)
     audio = audio.squeeze(0).to(torch.float32)
-    if sample_rate != _SAMPLE_RATE:
-        audio = torchaudio.functional.resample(audio, sample_rate, _SAMPLE_RATE)
-    return audio.cpu().numpy()
+    return audio, sample_rate
 
 
 def _audio_fingerprint(audio: np.ndarray) -> str:
