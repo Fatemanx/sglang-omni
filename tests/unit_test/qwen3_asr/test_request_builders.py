@@ -74,6 +74,13 @@ class _FakeTokenizer:
         return text
 
 
+def _wav_bytes(samples: np.ndarray, sample_rate: int, subtype: str) -> bytes:
+    sf = pytest.importorskip("soundfile")
+    buffer = io.BytesIO()
+    sf.write(buffer, samples, sample_rate, format="WAV", subtype=subtype)
+    return buffer.getvalue()
+
+
 def test_qwen3_asr_audio_token_length_formula_is_shared() -> None:
     lengths = torch.tensor([0, 1, 99, 100, 101, 3000], dtype=torch.long)
     expected = torch.tensor([0, 1, 13, 13, 14, 390], dtype=torch.long)
@@ -83,6 +90,91 @@ def test_qwen3_asr_audio_token_length_formula_is_shared() -> None:
     assert torch.equal(qwen3_asr_audio_token_lengths(lengths), expected)
     assert torch.equal(processor._get_feat_extract_output_lengths(lengths), expected)
     assert qwen3_asr_num_audio_tokens(3000) == 390
+
+
+@pytest.mark.parametrize("subtype", ["PCM_U8", "PCM_16", "PCM_24", "PCM_32"])
+@pytest.mark.parametrize("channels", [1, 2])
+def test_qwen3_asr_read_pcm_wav_bytes_matches_soundfile_for_integer_pcm(
+    subtype,
+    channels,
+) -> None:
+    sf = pytest.importorskip("soundfile")
+
+    sample_rate = 16000
+    mono = np.array(
+        [-0.75, -0.25, -0.01, 0.0, 0.01, 0.25, 0.75],
+        dtype=np.float32,
+    )
+    if channels == 1:
+        samples = mono
+    else:
+        samples = np.stack([mono, -0.5 * mono], axis=1)
+    data = _wav_bytes(samples, sample_rate, subtype)
+
+    audio, decoded_sample_rate = request_builders._read_pcm_wav_bytes(data)
+    expected, expected_sample_rate = sf.read(
+        io.BytesIO(data),
+        dtype="float32",
+        always_2d=False,
+    )
+
+    assert decoded_sample_rate == expected_sample_rate == sample_rate
+    assert audio.dtype == np.float32
+    assert audio.flags["C_CONTIGUOUS"]
+    assert audio.shape == expected.shape
+    np.testing.assert_allclose(audio, expected, atol=1.0e-7, rtol=0.0)
+
+
+def test_qwen3_asr_load_audio_uses_pcm_wav_bytes_fast_path(monkeypatch) -> None:
+    sf = pytest.importorskip("soundfile")
+
+    sample_rate = 16000
+    mono = np.linspace(-0.25, 0.25, sample_rate // 4, dtype=np.float32)
+    data = _wav_bytes(mono, sample_rate, "PCM_16")
+    expected, _ = sf.read(io.BytesIO(data), dtype="float32", always_2d=False)
+
+    def fail_if_soundfile_is_called(source):
+        raise AssertionError("soundfile should not run for PCM WAV bytes")
+
+    monkeypatch.setattr(
+        request_builders,
+        "_read_audio_with_soundfile",
+        fail_if_soundfile_is_called,
+    )
+
+    audio = request_builders.load_audio(data)
+
+    assert audio.dtype == np.float32
+    assert audio.flags["C_CONTIGUOUS"]
+    assert audio.shape == expected.shape
+    np.testing.assert_allclose(audio, expected, atol=1.0e-7, rtol=0.0)
+
+
+def test_qwen3_asr_load_audio_falls_back_to_soundfile_for_float_wav_bytes(
+    monkeypatch,
+) -> None:
+    sample_rate = 16000
+    mono = np.linspace(-0.25, 0.25, sample_rate // 4, dtype=np.float32)
+    data = _wav_bytes(mono, sample_rate, "FLOAT")
+    original_read = request_builders._read_audio_with_soundfile
+    calls: list[str] = []
+
+    def record_soundfile_read(source):
+        calls.append(type(source).__name__)
+        return original_read(source)
+
+    monkeypatch.setattr(
+        request_builders,
+        "_read_audio_with_soundfile",
+        record_soundfile_read,
+    )
+
+    audio = request_builders.load_audio(data)
+
+    assert calls == ["BytesIO"]
+    assert audio.dtype == np.float32
+    assert audio.flags["C_CONTIGUOUS"]
+    np.testing.assert_allclose(audio, mono, atol=1.0e-7, rtol=0.0)
 
 
 def test_qwen3_asr_load_audio_accepts_pathlike_wav(tmp_path) -> None:
